@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Leads Management: a six-hour build</title>
+<style>
+  :root{
+    --paper:#F8F7F3; --ink:#18222C; --muted:#54606B; --faint:#8A929B;
+    --accent:#0E7A5F; --rule:rgba(24,34,44,.14); --rule-soft:rgba(24,34,44,.08);
+    --ok:#0E7A5F; --no:#A0492B; --card:#FFFFFF;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0; background:var(--paper); color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    font-size:16px; line-height:1.6; -webkit-font-smoothing:antialiased;}
+  .wrap{max-width:720px; margin:0 auto; padding:0 26px;}
+  a{color:var(--accent); text-decoration:none;}
+  a:hover{text-decoration:underline;}
+  h1,h2,h3{font-weight:600; line-height:1.25; color:var(--ink);}
+
+  header.top{padding:64px 0 22px;}
+  .eyebrow{font-size:12px; letter-spacing:.16em; text-transform:uppercase; color:var(--accent); font-weight:600; margin:0 0 16px;}
+  h1{font-size:32px; letter-spacing:-.01em; margin:0 0 12px;}
+  .standfirst{font-size:17px; color:var(--muted); margin:0; max-width:60ch;}
+  .byline{font-size:13.5px; color:var(--faint); margin-top:20px; padding-top:16px; border-top:1px solid var(--rule);}
+
+  nav.toc{font-size:13.5px; line-height:1.9; color:var(--muted); margin:4px 0; padding:14px 0;
+    border-top:1px solid var(--rule); border-bottom:1px solid var(--rule); columns:2; column-gap:30px;}
+  nav.toc a{color:var(--muted);}
+
+  section{padding:8px 0;}
+  h2{font-size:21px; margin:40px 0 10px; padding-top:6px;}
+  h3{font-size:15px; margin:22px 0 6px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em;}
+  p{margin:0 0 14px;}
+  ul{margin:0 0 14px; padding-left:20px;} li{margin:4px 0;}
+
+  table{width:100%; border-collapse:collapse; font-size:14px; margin:14px 0;}
+  th,td{text-align:left; vertical-align:top; padding:9px 10px; border-bottom:1px solid var(--rule-soft);}
+  th{color:var(--faint); font-weight:600; font-size:11.5px; text-transform:uppercase; letter-spacing:.05em; border-bottom:1px solid var(--rule);}
+  td:first-child{font-weight:600;}
+  .timetable{table-layout:fixed;}
+  .timetable .ct{width:60px;} .timetable .ck{width:66px;} .timetable .cc{width:52px;} .timetable .ca{width:62px;}
+
+  ul.tick{list-style:none; padding:0; margin:10px 0; font-size:14px;}
+  ul.tick li{padding:5px 0 5px 24px; position:relative; border-bottom:1px solid var(--rule-soft);}
+  ul.tick li::before{position:absolute; left:0; top:5px; font-weight:700;}
+  ul.tick.ok li::before{content:"+"; color:var(--ok);}
+  ul.tick.no li::before{content:"\2013"; color:var(--no);}
+  ul.tick.next li::before{content:"\203A"; color:var(--muted);}
+
+  ol.steps{font-size:14px; line-height:1.5; padding-left:0; counter-reset:s; list-style:none; margin:12px 0;}
+  ol.steps li{counter-increment:s; padding:6px 0 6px 36px; position:relative; border-bottom:1px solid var(--rule-soft);}
+  ol.steps li::before{content:counter(s); position:absolute; left:0; top:6px; width:24px; height:24px;
+    background:rgba(14,122,95,.1); color:var(--accent); border-radius:50%; font-size:12px; font-weight:700;
+    display:flex; align-items:center; justify-content:center;}
+
+  code{font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace; font-size:13px; background:rgba(24,34,44,.06); padding:1px 5px; border-radius:4px;}
+  pre{font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace; font-size:13.5px; line-height:1.7;
+    background:var(--card); border:1px solid var(--rule); border-radius:8px; padding:16px 18px; overflow:auto; margin:14px 0;}
+  pre .c{color:var(--faint);}
+
+  .chart{background:var(--card); border:1px solid var(--rule); border-radius:8px; padding:14px 16px; margin:14px 0;}
+  .chart .cap{font-size:12px; color:var(--faint); margin:0 0 8px;}
+  svg{display:block; width:100%; height:auto;}
+
+  .stats{font-size:14px; color:var(--muted); margin:14px 0; padding:14px 0;
+    border-top:1px solid var(--rule); border-bottom:1px solid var(--rule); display:flex; flex-wrap:wrap; gap:6px 26px;}
+  .stats b{color:var(--ink); font-weight:600;}
+  .caption{font-size:12px; color:var(--faint); margin:4px 0 0;}
+
+  footer{padding:40px 0 70px; margin-top:24px; border-top:1px solid var(--rule); font-size:13.5px; color:var(--muted);}
+  footer .tag{display:block; margin-top:5px; font-size:12.5px; color:var(--faint);}
+  @media(max-width:560px){ h1{font-size:26px} nav.toc{columns:1} }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="top">
+    <p class="eyebrow">Candidate interview build</p>
+    <h1>Leads Management: a six-hour build</h1>
+    <p class="standfirst">A lead-intake platform for a law practice. This page documents scope, build
+      method, agent usage, tests, and results.</p>
+    <p class="byline">FastAPI, PostgreSQL, Next.js. Co-created with Claude Code.
+      Repository: <a href="https://github.com/sriddhi/leads-app">github.com/sriddhi/leads-app</a></p>
+  </header>
+
+  <section id="note">
+    <h2>Note to Alma</h2>
+    <p>Hackathon framing. About six focused hours, not continuous. Built with a product-engineer
+      perspective. Not production-grade; demo-grade with resilience where it counts.</p>
+
+    <h3>Framing</h3>
+    <table>
+      <tr><th>Item</th><th>Value</th></tr>
+      <tr><td>Effort</td><td>~6 focused hours, split across sessions with breaks</td></tr>
+      <tr><td>Perspective</td><td>Product engineer, not code generator</td></tr>
+      <tr><td>Grade</td><td>Demo, not production. Resilient at the public boundary</td></tr>
+      <tr><td>Agent setup</td><td>Basic configuration, light instructions (my full setup was disproportionate to the scope)</td></tr>
+    </table>
+
+    <h3>Product decisions</h3>
+    <table>
+      <tr><th>Decision</th><th>Choice in this build</th><th>Next step</th></tr>
+      <tr><td>Attorney specialization</td><td>None. Every attorney is equally empowered</td><td>Visa-type field, route on specialization</td></tr>
+      <tr><td>Case ownership</td><td>One attorney at a time</td><td>Keep; add audited hand-off</td></tr>
+      <tr><td>Unassign</td><td>Allowed, limited</td><td>Keep</td></tr>
+      <tr><td>Intake fields</td><td>Required name, email, resume. Added phone and message</td><td>Structured visa-type selection</td></tr>
+      <tr><td>Same phone/email/name</td><td>Linked and flagged, not merged, not rejected</td><td>Agent-on-behalf re-inquiry workflow</td></tr>
+    </table>
+    <p>The intake requirement was kept as specified. A free-text message was added because intake
+      without it was incomplete. A structured visa-type field was out of scope but is the change that
+      would make routing efficient rather than uniform. A repeat of the same phone, email, and name
+      can be a valid new inquiry, for example submitted by an agent on someone's behalf; that workflow
+      was out of scope, so the system links and flags rather than merging, which keeps it open later.</p>
+
+    <h3>Time allocation</h3>
+    <div class="chart">
+      <p class="cap">Hours per phase (wall-clock).</p>
+      <svg viewBox="0 0 640 178" role="img" aria-label="Bar chart of hours per phase">
+        <g font-family="-apple-system,sans-serif" font-size="12.5" fill="#18222C">
+          <text x="0" y="29">Agent setup</text>
+          <text x="0" y="62">Build, tests, security</text>
+          <text x="0" y="95">Test suite</text>
+          <text x="0" y="128">Email, prod-readiness</text>
+          <text x="0" y="161">Visual, formatting</text>
+        </g>
+        <g fill="#0E7A5F">
+          <rect x="185" y="16" width="99"  height="18" rx="3"/>
+          <rect x="185" y="49" width="395" height="18" rx="3"/>
+          <rect x="185" y="82" width="132" height="18" rx="3"/>
+          <rect x="185" y="115" width="66" height="18" rx="3"/>
+          <rect x="185" y="148" width="43" height="18" rx="3"/>
+        </g>
+        <g font-family="-apple-system,sans-serif" font-size="12" fill="#54606B">
+          <text x="290" y="29">45m</text>
+          <text x="586" y="62">3h</text>
+          <text x="323" y="95">1h</text>
+          <text x="257" y="128">30m</text>
+          <text x="234" y="161">20m</text>
+        </g>
+      </svg>
+    </div>
+
+    <table class="timetable">
+      <thead><tr><th>Phase</th><th class="ct">Time</th><th>Prompts (summary)</th><th class="ck">Tokens</th><th class="cc">Cost</th><th class="ca">Active</th></tr></thead>
+      <tbody>
+        <tr><td>Configure agent</td><td>45m</td><td>Trim setup to a basic config, light instructions</td><td>low</td><td>low</td><td>~15m</td></tr>
+        <tr><td>Build + e2e + APIs + security</td><td>3h</td><td>Specs as contracts; parallel slices; verify by running; size and field limits</td><td>high</td><td>high</td><td>~2h</td></tr>
+        <tr><td>Test suite</td><td>1h</td><td>Plan, contest twice, encode invariants, run</td><td>med</td><td>med</td><td>~40m</td></tr>
+        <tr><td>Email + prod-readiness</td><td>30m</td><td>Pluggable email; lint, types, naming, structure</td><td>med</td><td>med</td><td>~22m</td></tr>
+        <tr><td>Visual, formatting</td><td>20m</td><td>Tokens, layout, copy</td><td>low</td><td>low</td><td>~14m</td></tr>
+      </tbody>
+    </table>
+    <p class="caption">Token and cost are order-of-magnitude approximations; per-phase telemetry was
+      not instrumented. Active is approximate agent working time within each phase.</p>
+  </section>
+
+  <section id="scope">
+    <h2>Scope: covered, not covered, next</h2>
+    <h3>Covered</h3>
+    <ul class="tick ok">
+      <li>Public form: name, email, required resume (PDF/DOC/DOCX), plus phone and message</li>
+      <li>Email to prospect and attorney on submit; working interface, viewable in MailHog</li>
+      <li>Auth-guarded internal UI listing leads</li>
+      <li>Status PENDING to REACHED_OUT, set by the attorney, enforced server-side</li>
+      <li>Storage, email service, production-style structure, public repo, one-command run</li>
+      <li>Design doc, architecture doc, runbook, agent-usage doc, commit attribution</li>
+      <li>Added: admin dashboard, queue and assignment, capacity, audit trail, per-state time tracking, duplicate link-and-flag, case history, retention cleanup, load recipe, AWS deployment design (no implementation)</li>
+    </ul>
+    <h3>Not covered (deliberate)</h3>
+    <ul class="tick no">
+      <li>Structured visa-type selection and skill-based routing; only a free-text message exists</li>
+      <li>Multiple attorneys per case or collaboration</li>
+      <li>Agent-on-behalf re-inquiry as an intentional new-case workflow</li>
+      <li>MFA and advanced auth; backend is structured to accept it, not enabled</li>
+      <li>Real email provider and object storage in production; MailHog and local disk stand in</li>
+      <li>Multi-replica scale; rate limiter is in-memory, storage is local by design</li>
+    </ul>
+    <h3>Next</h3>
+    <ul class="tick next">
+      <li>Visa-type field, route on specialization instead of uniform capacity</li>
+      <li>S3 storage, SES email, shared rate limiter, multi-AZ RDS, autoscaling ECS; the seams exist</li>
+      <li>Maintained capacity counter or SELECT FOR UPDATE SKIP LOCKED on the assign hot path</li>
+      <li>Agent-on-behalf re-inquiry on top of link-and-flag</li>
+      <li>Observability and alarms; MFA as an option</li>
+    </ul>
+  </section>
+
+  <section id="arch">
+    <h2>Architecture</h2>
+    <p>Stack: FastAPI (async), PostgreSQL 16, SQLAlchemy and Alembic, JWT auth, Next.js 14, Tailwind,
+      Docker Compose. Layering is one-directional: thin endpoints, business logic in services (pure
+      where possible), data access in CRUD, Postgres as the source of truth.</p>
+    <h3>Correctness mechanisms</h3>
+    <table>
+      <tr><th>Mechanism</th><th>What it guarantees</th></tr>
+      <tr><td>Optimistic locking</td><td>Each lead has a version. A mutating write checks the expected version and increments it. Concurrent assignment yields one owner and a 409 for the other. No lost updates.</td></tr>
+      <tr><td>Append-only audit</td><td>Every state change writes an immutable row with actor, action, before, after. No update or delete path. Feeds a live SSE stream.</td></tr>
+      <tr><td>Interval timeline</td><td>Each state a lead enters is stored with entered_at and exited_at. Exactly one period open per lead. Attorney holding time is a query, not an estimate.</td></tr>
+      <tr><td>Duplicate link-and-flag</td><td>Matches on normalized email or phone are linked and flagged, never merged. Every application stays a separate, auditable record.</td></tr>
+    </table>
+    <h3>Boundary hardening</h3>
+    <p>Honeypot, per-IP rate limiting, idempotency keys, streaming upload-size cap, content-based file
+      validation by magic bytes, and a minimal public receipt that exposes no internal fields. Storage
+      and email are pluggable, so the AWS migration is configuration, not a rewrite.</p>
+  </section>
+
+  <section id="agent">
+    <h2>Building with the agent</h2>
+    <p>Claude Code was used as an orchestrator. The division of labor was the deciding factor.</p>
+    <table>
+      <tr><th>Owned by hand</th><th>Delegated to the agent</th></tr>
+      <tr>
+        <td>Data model, concurrency strategy, threat model, AWS seams, and the specifications: exact field names, paths, status codes, invariants.</td>
+        <td>Implementation against fixed specs: models, migrations, schemas, endpoints, services, the typed frontend, containers, first drafts of docs and tests.</td>
+      </tr>
+    </table>
+    <p>Verification was non-negotiable: run it. Reading agent output shows it is plausible; executing
+      it shows it is correct.</p>
+    <h3>Runtime defect example</h3>
+    <p>The agent pinned <code>passlib[bcrypt]==1.7.4</code> but left <code>bcrypt</code> unpinned. The
+      code type-checked and reviewed clean. Resolution pulled a modern <code>bcrypt</code>; the old
+      passlib runs an import-time probe that hashes an over-long string, and the new library raises
+      instead of truncating. Every password hash threw, so seeding and all logins failed. The fault
+      was in the interaction between two reasonable choices, not in any line. Found by running
+      <code>seed.py</code>. Fix: pin <code>bcrypt==4.0.1</code>. A later defect, a record number that
+      collided after deletions left gaps, was caught the same way, by the load test.</p>
+    <h3>Operating principles applied</h3>
+    <ul>
+      <li>Think before coding: the test plan was contested twice before harness code existed.</li>
+      <li>Simplicity first: one database, no broker, no speculative abstractions.</li>
+      <li>Surgical changes: defects fixed with one-line, localized edits plus a regression test.</li>
+      <li>Goal-driven: work backward from invariants and the error budget, so "done" was measurable.</li>
+    </ul>
+  </section>
+
+  <section id="context">
+    <h2>Agent effectiveness vs context size</h2>
+    <p>Output quality is not uniform across a session. It falls as the context window fills. The first
+      four hours were efficient; around hour five, effective output per turn dropped and the context
+      required compaction.</p>
+    <div class="chart">
+      <p class="cap">Relative effective output per turn vs session hour. Approximate, qualitative.</p>
+      <svg viewBox="0 0 640 240" role="img" aria-label="Line chart of effectiveness vs session hour">
+        <g stroke="rgba(24,34,44,.18)" stroke-width="1">
+          <line x1="70" y1="40" x2="70" y2="200"/>
+          <line x1="70" y1="200" x2="610" y2="200"/>
+          <line x1="70" y1="120" x2="610" y2="120" stroke="rgba(24,34,44,.07)"/>
+          <line x1="70" y1="40" x2="610" y2="40" stroke="rgba(24,34,44,.07)"/>
+        </g>
+        <g font-family="-apple-system,sans-serif" font-size="11" fill="#8A929B">
+          <text x="60" y="204" text-anchor="end">0</text>
+          <text x="60" y="124" text-anchor="end">50</text>
+          <text x="60" y="44" text-anchor="end">100</text>
+          <text x="70" y="226">h1</text><text x="158" y="226">h2</text><text x="247" y="226">h3</text>
+          <text x="335" y="226">h4</text><text x="423" y="226">h5</text><text x="512" y="226">h6</text><text x="600" y="226">h7</text>
+        </g>
+        <line x1="423" y1="40" x2="423" y2="200" stroke="#A0492B" stroke-width="1" stroke-dasharray="4 4"/>
+        <text x="429" y="52" font-family="-apple-system,sans-serif" font-size="11" fill="#A0492B">context compaction</text>
+        <polyline points="70,48 158,51 247,56 335,62 423,109 512,67 600,77" fill="none" stroke="#0E7A5F" stroke-width="2"/>
+        <g fill="#0E7A5F">
+          <circle cx="70" cy="48" r="3"/><circle cx="158" cy="51" r="3"/><circle cx="247" cy="56" r="3"/>
+          <circle cx="335" cy="62" r="3"/><circle cx="423" cy="109" r="3"/><circle cx="512" cy="67" r="3"/><circle cx="600" cy="77" r="3"/>
+        </g>
+      </svg>
+    </div>
+    <p>Mechanism and remedy: the full history is reprocessed each turn, so per-turn cost and latency
+      rise with length, and early constraints compete with everything since and get dropped. Keep
+      context lean. Scope each session to one task, summarize, restart, and re-state the invariants
+      that must survive.</p>
+  </section>
+
+  <section id="process">
+    <h2>Process, in eleven steps</h2>
+    <ol class="steps">
+      <li>Basic use case: three roles, one intake-to-outreach path.</li>
+      <li>Constraints: one attorney per case, equal empowerment, link-not-merge, size and field limits, threat model.</li>
+      <li>MVP: thinnest slice that runs end to end across all roles.</li>
+      <li>Structure and unit tests: layering and a pure, fast-to-test core.</li>
+      <li>Fill the details: the flows the real system needs.</li>
+      <li>One large implementation against the fixed specs.</li>
+      <li>Integration test suite design: state-based invariants and an error budget.</li>
+      <li>Email integration: pluggable backends, fire-and-forget, viewable locally.</li>
+      <li>Run the integration tests; fix what running exposes.</li>
+      <li>Human test run: every role through the UI by hand.</li>
+      <li>Document and push: readme, design, architecture, runbook, agent usage; clean history.</li>
+    </ol>
+  </section>
+
+  <section id="tests">
+    <h2>Tests and results</h2>
+    <p>The suite is built to be able to fail. Correctness is checked with state-based invariants, not
+      timing, so results are deterministic regardless of host speed. A self-test plants known defects
+      first to prove the harness can go red before any run is trusted.</p>
+    <h3>Gates</h3>
+    <ul class="tick ok">
+      <li>Error budget: run fails if the request error rate exceeds the configured budget, set at 2 percent, adjustable per run</li>
+      <li>Zero server errors: any 5xx fails the run</li>
+      <li>All invariants hold: single assignee, capacity exact at the boundary, distinct leads (no merge), one open period per lead, audit completeness, history semantics, pinned public-receipt contract, retention</li>
+    </ul>
+    <p>The recipe drives 1,000 applications through 75 concurrent attorneys at capacity 10, exercises
+      every flow and edge case, and restores a clean baseline afterward. Source:
+      <code>backend/tests/load</code>. Latest run:</p>
+    <div class="stats">
+      <span><b>1,000 / 1,000</b> created, zero errors</span>
+      <span><b>0.00%</b> error rate (gate 2%)</span>
+      <span><b>0</b> server errors</span>
+      <span><b>100%</b> invariants held</span>
+    </div>
+    <p>Under that load the system recorded thousands of version conflicts and zero double-assignments.
+      The lock degraded into bounded contention, not corruption.</p>
+  </section>
+
+  <section id="critique">
+    <h2>Agent critique</h2>
+    <table>
+      <tr><th>Limitation</th><th>Observed in this build</th></tr>
+      <tr><td>Plausible but wrong in interactions</td><td>Files reviewed clean while the system failed at runtime. The dependency-interaction bug and the gap-induced number collision both passed inspection. Only execution closes the gap.</td></tr>
+      <tr><td>Degrades as context grows</td><td>Quality and efficiency fall as the window fills. Early constraints get dropped, work is repeated, per-turn cost climbs. The operator must ration context.</td></tr>
+      <tr><td>Expands scope unless held back</td><td>Adds abstraction and surface area unprompted. Simplicity is a constraint to impose, not the default.</td></tr>
+      <tr><td>Only as good as the spec</td><td>Ambiguity is met with confident guessing, not a question. Output quality tracks the precision of the specification.</td></tr>
+    </table>
+    <p>Net: the agent moved the bottleneck from typing to deciding and from writing to verifying. The
+      leverage is real and front-loaded into the specification and the verification.</p>
+  </section>
+
+  <section id="run">
+    <h2>Run it</h2>
+    <p>One prerequisite: Docker. The system migrates and seeds itself, including one worked example
+      case, so there is nothing to configure.</p>
+    <pre><span class="c"># clone and run</span>
+git clone https://github.com/sriddhi/leads-app.git &amp;&amp; cd leads-app
+docker compose up --build</pre>
+    <table>
+      <tr><th>Surface</th><th>URL or credential</th></tr>
+      <tr><td>Application form</td><td><code>localhost:3000</code></td></tr>
+      <tr><td>Sign-in</td><td><code>localhost:3000/login</code></td></tr>
+      <tr><td>API docs (Swagger)</td><td><code>localhost:8000/docs</code></td></tr>
+      <tr><td>Email inbox (MailHog)</td><td><code>localhost:8025</code></td></tr>
+      <tr><td>Admin</td><td><code>admin@company.com / admin123</code></td></tr>
+      <tr><td>Attorney</td><td><code>attorney@company.com / attorney123</code></td></tr>
+    </table>
+    <pre><span class="c"># everyday suite, then the full 1,000-lead correctness-and-load run</span>
+docker exec leadsdemo-backend-1 pytest --ignore=tests/load
+python -m tests.load.run --profile demo</pre>
+    <p>Full design, architecture, runbook, and agent-usage documents are in the repository.</p>
+  </section>
+
+  <footer>
+    Built for a candidate interview with Alma. Not business code.
+    <span class="tag">Demo-grade trade-offs over production hardening. Co-created with Claude Code.</span>
+  </footer>
+
+</div>
+</body>
+</html>
