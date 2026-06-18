@@ -1,0 +1,72 @@
+# Clone-and-run: `git clone … && docker compose up --build`
+# No manual .env needed — working defaults are inlined below. The backend container
+# auto-applies migrations and seeds (admin + attorneys) before serving.
+# Host ports are overridable (e.g. POSTGRES_PORT=15432 docker compose up) so the stack
+# can run alongside other services; defaults are the standard 5432/8000/3000.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: leads_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d leads_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: ./backend
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/leads_db
+      SECRET_KEY: ${SECRET_KEY:-dev-secret-change-in-production}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      ATTORNEY_EMAIL: ${ATTORNEY_EMAIL:-attorney@company.com}
+      UPLOAD_DIR: ./uploads
+      # Allow the frontend origin (honours FRONTEND_PORT) for browser CORS.
+      CORS_ORIGINS: '["http://localhost:${FRONTEND_PORT:-3000}"]'
+      # Real, viewable email with no external provider: deliver to MailHog (UI on :8025).
+      EMAIL_BACKEND: ${EMAIL_BACKEND:-smtp}
+      SMTP_HOST: mailhog
+      SMTP_PORT: "1025"
+      # Default protects the public form; raise it (e.g. 1000000) for load-test runs.
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX:-10}
+    # Migrate + seed (idempotent) before serving — so a fresh clone has a correct, populated DB.
+    command: >
+      sh -c "alembic upgrade head &&
+             python seed.py &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./backend/uploads:/app/uploads
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # NEXT_PUBLIC_* is baked at build time; pass the browser-facing backend URL.
+        NEXT_PUBLIC_API_URL: http://localhost:${BACKEND_PORT:-8000}
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      - backend
+
+  # Local SMTP catcher — submitted-lead emails land here, viewable in the browser.
+  # No external account/keys needed; perfect for demo + manual testing.
+  mailhog:
+    image: mailhog/mailhog:latest
+    ports:
+      - "${SMTP_PORT:-1025}:1025"      # SMTP
+      - "${MAILHOG_UI_PORT:-8025}:8025" # web UI
+
+volumes:
+  postgres_data:

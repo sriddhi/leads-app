@@ -1,0 +1,5 @@
+# Backend test/dev dependencies (installed into backend/venv alongside requirements.txt).
+# Keeps the "unit tests" gate runnable from a clean clone.
+-r requirements.txt
+pytest==8.2.0
+pytest-asyncio==0.23.7

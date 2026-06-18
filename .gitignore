@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+backend/.env
+backend/uploads/
+
+# Node
+node_modules/
+.next/
+*.tsbuildinfo
+frontend/.env.local
+frontend/.env
+
+# General
+.DS_Store
+*.log
+.env
+
+# Transient load-run outputs (the curated baseline lives in docs/benchmarks/)
+backend/tests/load/reports/
