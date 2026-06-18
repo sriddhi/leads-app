@@ -555,6 +555,13 @@ async def transition_related(
     note = (body.note or "").strip()
     reason = f"{ref}. {note}" if note else ref
 
+    # Self-assign is capacity-gated: lock the caller's row once up front so the per-lead checks
+    # below are atomic against concurrent assignments for the whole batch (no over-commit). The
+    # lock is held for the transaction and is unaffected by the per-lead savepoints; the per-lead
+    # has_capacity() re-counts (seeing earlier assigns in this batch) but need not re-lock.
+    if body.action == "assign":
+        await assignment.lock_attorney(db, current_user.id)
+
     results: list[RelatedTransitionResult] = []
     for target_id in body.lead_ids:
         lead = eligible.get(target_id)
@@ -564,6 +571,11 @@ async def transition_related(
                 detail="Not an open lead in this duplicate cluster.",
             ))
             continue
+
+        # Capture identity BEFORE the savepoint. A StaleDataError rolls the savepoint back and
+        # EXPIRES this lead's attributes, so reading lead.lead_number afterwards would trigger a
+        # lazy reload — sync IO in an async context (MissingGreenlet). Plain locals are safe.
+        lead_id, lead_no = lead.id, lead.lead_number
 
         # Each lead is mutated inside its own SAVEPOINT. The version_id_col compare-and-swap
         # can raise StaleDataError if a lead was changed concurrently; the savepoint lets us
@@ -611,15 +623,15 @@ async def transition_related(
                     )
                     detail = "Marked reached out."
             results.append(RelatedTransitionResult(
-                id=lead.id, lead_number=lead.lead_number, ok=True, detail=detail,
+                id=lead_id, lead_number=lead_no, ok=True, detail=detail,
             ))
         except _SkipReason as skip:
             results.append(RelatedTransitionResult(
-                id=lead.id, lead_number=lead.lead_number, ok=False, detail=str(skip),
+                id=lead_id, lead_number=lead_no, ok=False, detail=str(skip),
             ))
         except StaleDataError:
             results.append(RelatedTransitionResult(
-                id=lead.id, lead_number=lead.lead_number, ok=False,
+                id=lead_id, lead_number=lead_no, ok=False,
                 detail="Changed by someone else; reload and retry.",
             ))
     return results
@@ -672,10 +684,12 @@ async def _flush_or_conflict(db: AsyncSession) -> None:
     try:
         await db.flush()
     except StaleDataError:
+        # `from None`: a lost optimistic-lock race is an expected 409, not an internal error —
+        # suppress the StaleDataError chain so it doesn't surface as a traceback in logs.
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="This lead was just modified by someone else. Reload and retry.",
-        )
+        ) from None
 
 
 @router.post(
@@ -698,7 +712,7 @@ async def assign_lead(
             detail="Lead is already assigned.",
         )
 
-    if not await assignment.has_capacity(db, current_user):
+    if not await assignment.has_capacity(db, current_user, lock=True):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="You are at your maximum open case capacity.",
@@ -756,7 +770,7 @@ async def reassign_lead(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="Target must be an active attorney.",
             )
-        if not await assignment.has_capacity(db, target):
+        if not await assignment.has_capacity(db, target, lock=True):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Target attorney is at maximum open case capacity.",

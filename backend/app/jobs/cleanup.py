@@ -46,7 +46,12 @@ async def purge_old_cases(
                 delete(LeadStatePeriod).where(LeadStatePeriod.lead_id == lead.id)
             )
             await db.execute(delete(AuditEvent).where(AuditEvent.lead_id == lead.id))
-            await db.delete(lead)
+            # Core DELETE by id (not ORM session.delete) so the retention purge is unconditional.
+            # The ORM delete would carry the version_id_col predicate (... AND version = :loaded)
+            # and raise StaleDataError — aborting the whole batch — if an ancient lead happened to
+            # be modified between this batch's SELECT and the delete. Purge deletes by id, period.
+            await db.execute(delete(Lead).where(Lead.id == lead.id))
+            db.expunge(lead)
             await db.flush()
             # Resume file (best-effort; ignores missing).
             if resume:

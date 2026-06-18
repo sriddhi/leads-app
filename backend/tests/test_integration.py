@@ -283,6 +283,111 @@ async def test_auto_assign_bumps_version_no_gap():
             await c.put(f"{BASE}/admin/settings/auto-assign", json={"enabled": False}, headers=admin)
 
 
+async def test_bulk_related_transition_conflict_degrades_per_lead():
+    """The bulk transition mutates each lead inside its own SAVEPOINT. When two callers race
+    the same clustered lead, the loser hits the version_id_col CAS (StaleDataError) — which must
+    roll back only that lead's savepoint and report it as a per-lead failure, NOT 500 the batch.
+    Exactly one winner; the lead is assigned once."""
+    async with _client() as c:
+        admin = await _auth(c, "admin@company.com", "admin123")
+        att = await _auth(c, "attorney@company.com", "attorney123")
+        att2 = await _auth(c, "attorney2@company.com", "attorney123")
+        await c.put(f"{BASE}/admin/settings/auto-assign", json={"enabled": False}, headers=admin)
+        await _free_capacity(c, admin, "attorney@company.com")
+        await _free_capacity(c, admin, "attorney2@company.com")
+
+        shared = _uniq("bulkrace")
+        ln_a = (await _submit(c, first="Sam", last="Lee", email=shared)).json()["lead_number"]
+        ln_b = (await _submit(c, first="Sam", last="Lee", email=shared)).json()["lead_number"]
+        a = await _by_number(c, att, ln_a)
+        b = await _by_number(c, att, ln_b)
+        assert b["duplicate_of"] == a["id"]
+
+        body = {"action": "assign", "lead_ids": [b["id"]]}
+        r1, r2 = await asyncio.gather(
+            c.post(f"{BASE}/leads/{a['id']}/related/transition", json=body, headers=att),
+            c.post(f"{BASE}/leads/{a['id']}/related/transition", json=body, headers=att2),
+        )
+        # Neither request fails outright — the batch always returns 200 with per-lead results.
+        assert r1.status_code == 200 and r2.status_code == 200, (r1.text, r2.text)
+        oks = sorted([r1.json()[0]["ok"], r2.json()[0]["ok"]])
+        assert oks == [False, True], (r1.json(), r2.json())  # exactly one winner
+        after = await _by_number(c, admin, ln_b)
+        assert after["assignee_id"] is not None
+        assert after["version"] == b["version"] + 1  # assigned exactly once
+
+
+async def _set_capacity(c, admin, email, cap) -> None:
+    attorneys = (await c.get(f"{BASE}/admin/attorneys", headers=admin)).json()
+    aid = next(a["id"] for a in attorneys if a["email"] == email)
+    await c.put(f"{BASE}/admin/attorneys/{aid}/capacity", json={"max_open_cases": cap}, headers=admin)
+
+
+async def test_concurrent_assign_cannot_over_commit_capacity():
+    """The capacity over-commit race: two assignments of DIFFERENT leads to the same attorney
+    both pass the count-then-assign check before either commits, pushing the attorney past cap.
+    The lead-version CAS can't catch it (different rows), so only assignment.lock_attorney's row
+    lock can. This is driven at the session level with a controlled interleave (a hold between
+    the capacity check and commit) so the race is deterministic, not timing-dependent: WITH the
+    lock the second checker blocks until the first commits and then correctly refuses; WITHOUT
+    it (regression) both would land. Verified to fail if the lock is removed."""
+    import uuid as _uuid
+    from sqlalchemy import select
+    from app.core.database import AsyncSessionLocal
+    from app.models.lead import Lead
+    from app.models.user import User
+    from app.services import assignment
+
+    email = "attorney3@company.com"
+    async with _client() as c:
+        admin = await _auth(c, "admin@company.com", "admin123")
+        await c.put(f"{BASE}/admin/settings/auto-assign", json={"enabled": False}, headers=admin)
+        attorneys = (await c.get(f"{BASE}/admin/attorneys", headers=admin)).json()
+        att_id = _uuid.UUID(next(a["id"] for a in attorneys if a["email"] == email))
+
+        # Read true current load, then leave EXACTLY one open slot.
+        async with AsyncSessionLocal() as s:
+            base_load = await assignment.open_case_count(s, att_id)
+        await _set_capacity(c, admin, email, base_load + 1)
+
+        ln1 = (await _submit(c, first="Cap1", email=_uniq("cap1"))).json()["lead_number"]
+        ln2 = (await _submit(c, first="Cap2", email=_uniq("cap2"))).json()["lead_number"]
+        lid1 = _uuid.UUID((await _by_number(c, admin, ln1))["id"])
+        lid2 = _uuid.UUID((await _by_number(c, admin, ln2))["id"])
+
+        async def claim(lead_id, hold):
+            """One assignment attempt in its own session: capacity-check (with the row lock),
+            hold the window open, then assign + commit. Returns True if it assigned."""
+            async with AsyncSessionLocal() as s:
+                att = (await s.execute(select(User).where(User.id == att_id))).scalar_one()
+                if not await assignment.has_capacity(s, att, lock=True):
+                    return False
+                await asyncio.sleep(hold)
+                lead = (await s.execute(select(Lead).where(Lead.id == lead_id))).scalar_one()
+                lead.assignee_id = att_id
+                s.add(lead)
+                await s.commit()
+                return True
+
+        try:
+            # Both start together; the holds force both past their capacity check before the
+            # first commits — exactly the over-commit window.
+            r1, r2 = await asyncio.gather(claim(lid1, 0.4), claim(lid2, 0.4))
+            assert sorted([r1, r2]) == [False, True], (r1, r2)  # exactly one landed
+            async with AsyncSessionLocal() as s:
+                final_load = await assignment.open_case_count(s, att_id)
+            assert final_load == base_load + 1, f"over-committed: {final_load} > cap {base_load + 1}"
+        finally:
+            # Unassign whatever landed and restore the seed default cap.
+            async with AsyncSessionLocal() as s:
+                for lid in (lid1, lid2):
+                    lead = (await s.execute(select(Lead).where(Lead.id == lid))).scalar_one()
+                    lead.assignee_id = None
+                    s.add(lead)
+                await s.commit()
+            await _set_capacity(c, admin, email, 20)
+
+
 async def test_reached_out_requires_assignment_and_reversal_restores_state():
     async with _client() as c:
         att = await _auth(c)
