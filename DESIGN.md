@@ -1,276 +1,454 @@
-# Design Document — Leads Management App
+# System Design — Leads Management Platform
 
-This document explains the architectural decisions behind the leads management application: why each technology was chosen, what tradeoffs were made, and what would change in a production system.
+This document explains **what** the system is, **how** it's put together, and **why** the
+key decisions were made. It's organized so a reader can go from a 30-second mental model
+(the diagrams) to the reasoning behind each choice.
 
----
-
-## 1. Architecture Overview
-
-```
-                    ┌──────────────────────────────────┐
-                    │          Browser / Client         │
-                    └──────────────┬───────────────────┘
-                                   │ HTTP/HTTPS
-                    ┌──────────────▼───────────────────┐
-                    │       Next.js 14 Frontend         │
-                    │  (App Router, React Server        │
-                    │   Components + Client Components) │
-                    └──────────────┬───────────────────┘
-                                   │ REST API (JSON)
-                    ┌──────────────▼───────────────────┐
-                    │       FastAPI Backend             │
-                    │  (async Python, JWT auth,         │
-                    │   Pydantic v2 validation)         │
-                    └──────┬──────────────┬────────────┘
-                           │              │
-              ┌────────────▼───┐   ┌──────▼──────────┐
-              │  PostgreSQL 16  │   │  Local Filesystem│
-              │  (leads, users) │   │  (/uploads)      │
-              └────────────────┘   └──────────────────┘
-                                          │
-                                   ┌──────▼──────────┐
-                                   │  Resend Email   │
-                                   │  (transactional)│
-                                   └─────────────────┘
-```
-
-### Two user paths
-
-**Public path (prospect submits a lead)**
-1. Prospect visits the root page (`/`)
-2. Fills out the lead form (name, email, phone, message, optional file upload)
-3. Frontend POST to `POST /api/leads` — no auth required
-4. Backend creates the lead record, fires off two emails asynchronously (confirmation to prospect, notification to attorney)
-5. Prospect sees a success screen
-
-**Internal path (attorney manages leads)**
-1. Attorney navigates to `/login`, submits credentials
-2. Frontend POST to `POST /api/auth/login`, receives a JWT
-3. JWT stored in localStorage; included as `Authorization: Bearer <token>` on every subsequent request
-4. Attorney browses `/dashboard` — paginated lead list with status filter
-5. Attorney clicks a lead to view detail and update status via `PATCH /api/leads/{id}/status`
+> Diagrams are [Mermaid](https://mermaid.js.org/) and render natively on GitHub.
 
 ---
 
-## 2. API Design Choices
+## 1. Design principles
 
-### Why FastAPI
+Three ideas drove every decision. When two pulled against each other, the one higher on this
+list won.
 
-- **Async-first**: built on Starlette and asyncio — handles concurrent I/O (DB queries, email calls) without blocking
-- **Automatic OpenAPI docs**: interactive docs at `/docs` out of the box, useful during development
-- **Pydantic v2**: strict request/response validation with type inference; errors are returned as structured JSON automatically
-- **Production-ready**: used at scale by many companies; not a toy framework
+1. **Simplicity first.** The smallest thing that fully solves the problem. One Postgres, one
+   API, one web app — no message broker, no cache, no microservices for a workload this size.
+   Complexity is added only when a concrete requirement demands it (e.g., interval-based time
+   tracking exists because "justify attorney time" is a real requirement; a job queue does not,
+   because nothing needs one yet).
+2. **Correctness under concurrency.** Many attorneys act on a shared queue at once. The design
+   makes the dangerous things *impossible*, not merely unlikely: optimistic locking prevents
+   double-assignment and lost updates, and an append-only audit trail makes every state change
+   accountable.
+3. **UX = clarity, not chrome.** The interface's job is to show the *right* data at the *right*
+   density. A prospect sees a single calm form. An attorney sees a FIFO queue, their own
+   intakes, and one detail view that puts the timeline, case history, and related duplicates
+   side by side — so a decision can be made without leaving the page. Information hierarchy over
+   ornament.
 
-### RESTful resource design
+---
 
-The lead is the core resource. Endpoints follow REST conventions:
+## 2. Tech stack
 
-```
-POST   /api/leads                  create
-GET    /api/leads                  list (with pagination + filter)
-GET    /api/leads/{id}             read one
-PATCH  /api/leads/{id}/status      update status
-GET    /api/leads/{id}/resume      download file
-```
-
-### Why PATCH (not PUT) for status updates
-
-`PUT` implies full replacement of the resource. The client would need to send every lead field to avoid accidentally nulling out fields it didn't include. `PATCH` with an explicit `status` field makes the intent clear: this is a controlled state transition, not a full replacement. It also prevents the client from accidentally overwriting other fields.
-
-### Pagination design
-
-List endpoint uses `page` / `page_size` query parameters (offset pagination) rather than cursor pagination. Tradeoffs:
-
-| | Offset pagination | Cursor pagination |
+| Layer | Choice | Why |
 |---|---|---|
-| Simplicity | Simple to implement and reason about | More complex |
-| Random access | Supports page jumps (e.g. "go to page 5") | Cannot jump to arbitrary page |
-| Consistency under inserts | New inserts can shift pages | Stable cursor |
-| At expected scale (<10k leads) | Perfectly fine | Unnecessary complexity |
-
-Offset pagination is the right call here. Cursor pagination would be worth revisiting if the leads table grew to millions of rows with high insert frequency.
-
----
-
-## 3. Database Design
-
-### Why PostgreSQL
-
-- ACID guarantees — lead data must not be lost or partially written
-- Native UUID type — used for primary keys
-- Timezone-aware timestamps (`TIMESTAMP WITH TIME ZONE`) — avoids the classic "what timezone is this?" bug
-- Well-supported by SQLAlchemy and asyncpg
-
-### Why SQLAlchemy 2.x async + asyncpg
-
-- **asyncpg** is the fastest PostgreSQL driver for Python (binary protocol, no libpq dependency)
-- **SQLAlchemy 2.x async** wraps asyncpg with a familiar ORM interface; supports `async with session` context managers
-- Keeps DB operations non-blocking — the FastAPI event loop is not stalled waiting for queries
-
-### Why Alembic
-
-Schema migrations need to be version-controlled and repeatable. Alembic integrates directly with SQLAlchemy models (`--autogenerate` diffs the ORM against the live DB and generates migration scripts). This means schema evolution is tracked in git alongside the code that depends on it.
-
-### Schema decisions
-
-**UUID primary keys**
-
-```python
-id: Mapped[UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid4)
-```
-
-- Globally unique — safe to generate client-side or in distributed systems without coordination
-- No sequential leakage — an attacker cannot enumerate records by incrementing an integer ID
-- Slight storage overhead vs. integer PKs, but negligible at this scale
-
-**Server-side timestamp defaults**
-
-```python
-created_at: Mapped[datetime] = mapped_column(server_default=func.now())
-updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
-```
-
-Timestamps are set by the database server, not the application. This avoids clock skew issues if multiple application instances are running.
-
-**Status as VARCHAR with application-level enum**
-
-Status is stored as a plain `VARCHAR` in the database, with the valid values enforced by a Python `Enum` in the application layer. This means:
-- Adding a new status (e.g. `on_hold`) requires only a code change, not a database migration
-- The database does not enforce the constraint, which is a tradeoff — invalid values could be inserted via direct SQL. Acceptable for this scope.
-
-An alternative is a PostgreSQL `ENUM` type, which enforces the constraint at the DB level but requires a migration to add new values.
+| API | **FastAPI** (Python 3.11, async) | Async I/O for concurrent attorneys; Pydantic validation and auto-generated OpenAPI/Swagger come for free. |
+| Persistence | **PostgreSQL 16** | Relational integrity (FKs, unique constraints), `JSONB` for audit payloads, transactional guarantees the correctness model relies on. |
+| ORM / migrations | **SQLAlchemy 2.x async + asyncpg**, **Alembic** | Typed models, explicit hand-authored migrations (no surprise autogen drift). |
+| Auth | **JWT (HS256, 24h)** + **bcrypt** via passlib | Stateless tokens; no session store needed. |
+| Email | **Pluggable: console / SMTP (MailHog) / Resend** | Real, viewable email locally with zero external accounts; one swap to a provider in prod. |
+| Frontend | **Next.js 14 (App Router)** + **Tailwind** | Server-aware React with a small, themeable component library; Alma-inspired navy/teal tokens. |
+| Local orchestration | **Docker Compose** | One command brings up the whole system, self-migrating and self-seeding. |
 
 ---
 
-## 4. Authentication & Security
+## 3. Deployment architecture — Docker today, AWS tomorrow
 
-### JWT Bearer tokens
+### Today (local / demo) — one `docker compose up`
 
-```
-POST /api/auth/login → { access_token, token_type: "bearer" }
-```
-
-- **Stateless**: the server does not store session state; any instance can verify any token
-- **24-hour expiry**: balances security (short-lived tokens reduce the blast radius of token theft) against UX (attorney does not need to re-login every few hours)
-- **HS256 signing**: symmetric signing with `SECRET_KEY`; fast to verify
-
-### Bcrypt password hashing
-
-Passwords are hashed with bcrypt before storage. Bcrypt is intentionally slow (configurable work factor), which means even if the database is leaked, an attacker cannot crack passwords quickly via brute force or precomputed tables.
-
-### Why not OAuth/SSO
-
-Out of scope for this exercise. In a real production deployment, attorney login would use SSO (Google Workspace, Okta, Azure AD) rather than username/password. This eliminates the need to store passwords at all and centralizes identity management. The JWT-based approach used here is a reasonable stand-in that demonstrates the auth flow clearly.
-
-### File upload security
-
-Uploaded resumes go through several checks before being stored:
-
-1. **MIME type validation**: only `application/pdf`, `application/msword`, and `application/vnd.openxmlformats-officedocument.wordprocessingml.document` are accepted
-2. **Filename sanitization**: original filename is discarded; files are stored as `{uuid}_{original_name}` to prevent path traversal attacks
-3. **Size limit**: files over 20MB are rejected before reading the full stream
-4. **Served as static files**: uploaded files are served separately from the API, under `/uploads/`, preventing them from being executed as code
-
----
-
-## 5. File Storage
-
-Files are stored on the local filesystem in an `uploads/` directory. The backend mounts this directory as a StaticFiles route so uploaded resumes are accessible via URL.
-
-This is appropriate for a single-instance deployment but does not scale horizontally — if you run multiple backend instances, they do not share the same filesystem. In production:
-
-- **S3 or GCS**: store files in object storage; return a pre-signed URL for download
-- **CDN**: serve files through a CDN for better performance and reduced backend load
-- **Lifecycle policies**: automatically delete files after a retention period if needed
-
-The local filesystem approach was chosen here for simplicity — it requires no external service and keeps the development setup self-contained.
-
----
-
-## 6. Email Architecture
-
-### Why Resend over SendGrid/Mailgun
-
-- Simpler API surface (a single `send` call with minimal required fields)
-- Better developer experience (clear error messages, no IP warming required for low volume)
-- Generous free tier (3,000 emails/month, 100/day)
-- Modern SDK with first-class Python support
-
-### Fire-and-forget with asyncio.create_task
-
-Emails are sent asynchronously using `asyncio.create_task`:
-
-```python
-@router.post("/api/leads")
-async def create_lead(...):
-    lead = await crud.create_lead(db, ...)
-    asyncio.create_task(email_service.send_confirmation(lead))
-    asyncio.create_task(email_service.send_attorney_notification(lead))
-    return lead
+```mermaid
+flowchart LR
+  Browser["Browser"] -->|":3000"| FE["Next.js (web)"]
+  FE -->|"/api/v1 :8000"| API["FastAPI (backend)"]
+  API -->|"asyncpg"| DB[("PostgreSQL 16")]
+  API -->|"SMTP :1025"| MH["MailHog<br/>(catch-all inbox, UI :8025)"]
+  API -->|"write"| FS["resume uploads<br/>(local volume)"]
+  subgraph compose["docker compose (one network)"]
+    FE
+    API
+    DB
+    MH
+    FS
+  end
 ```
 
-This means:
-- The HTTP response is returned to the client immediately after the lead is saved
-- Email sending happens in the background and does not block the response
-- A failed email never causes the lead creation to fail or return an error to the prospect
+The backend container waits for Postgres to be healthy, runs `alembic upgrade head`, seeds a
+demo baseline (named users + one fully-worked example lead), then serves. No `.env`, no manual
+steps.
 
-The tasks are created inside an async FastAPI endpoint, which means there is always a running event loop — the `create_task` call is safe. Each task wraps its body in a `try/except` so a Resend API error is logged but does not propagate and kill the task.
+### Tomorrow (AWS) — same shapes, managed services
 
----
+The architecture is intentionally *lift-and-shift friendly*: each box above maps to a managed
+AWS service with no code rewrite, only configuration.
 
-## 7. Frontend Design
-
-### Next.js 14 App Router
-
-The frontend uses Next.js 14 with the App Router (introduced in Next.js 13). Key decisions:
-
-- **File-system routing**: routes map directly to directories under `src/app/`
-- **Server vs. client components**: pages that only render HTML (no interactivity) are React Server Components by default; components that use hooks (`useState`, `useEffect`) are marked `"use client"`
-- **Layout files**: `layout.tsx` files wrap child routes; the dashboard layout enforces authentication for all `/dashboard/*` routes in a single place
-
-### Auth storage
-
-JWT tokens are stored in `localStorage`. This is simple and works well for this exercise. In production, this approach has a known weakness: localStorage is accessible to any JavaScript running on the page, including injected scripts (XSS). The production approach is:
-
-- Store the token in an **httpOnly cookie** (inaccessible to JavaScript)
-- Use a **refresh token** (long-lived, httpOnly cookie) to issue new short-lived access tokens
-- Implement **token rotation**: refresh tokens are single-use
-
-### Dashboard auth guard
-
-```typescript
-// src/app/dashboard/layout.tsx
-export default function DashboardLayout({ children }) {
-  const token = useAuth(); // redirects to /login if no token
-  if (!token) return null;
-  return <>{children}</>;
-}
+```mermaid
+flowchart TB
+  U["Users"] --> CF["CloudFront + WAF"]
+  CF --> S3["S3 (Next.js static assets)"]
+  CF --> ALB["Application Load Balancer"]
+  ALB --> ECS["FastAPI on ECS Fargate<br/>(auto-scaling tasks)"]
+  ECS --> RDS[("RDS PostgreSQL<br/>Multi-AZ")]
+  ECS --> S3R["S3 (resume objects,<br/>pre-signed URLs)"]
+  ECS --> SES["SES / Resend<br/>(transactional email)"]
+  ECS --> SM["Secrets Manager<br/>(JWT key, DB creds)"]
+  ECS --> CW["CloudWatch (logs + metrics)"]
 ```
 
-This pattern centralizes auth enforcement. Any new route added under `/dashboard/` is automatically protected without needing to add auth checks to each page individually.
+**The migration path, by component:**
 
-### Form validation with zod + react-hook-form
-
-- **zod**: schema-first validation library; define the schema once and get TypeScript types inferred automatically
-- **react-hook-form**: minimal re-renders, integrates cleanly with zod via `@hookform/resolvers/zod`
-- Validation errors are displayed inline next to each field without a round-trip to the server
-
----
-
-## 8. What Would Change in Production
-
-| Area | Current (exercise) | Production |
+| Local | AWS | Change required |
 |---|---|---|
-| Auth token storage | localStorage | httpOnly cookie + refresh token rotation |
-| Password auth | bcrypt username/password | SSO (Google/Okta/Azure AD) |
-| File storage | Local filesystem | S3/GCS with pre-signed download URLs |
-| Rate limiting | None | Rate limit public lead submission endpoint (e.g. 5 req/min per IP) |
-| Caching | None | Redis for hot data (e.g. lead counts, recent activity) |
-| Background jobs | asyncio.create_task | Celery + Redis or a managed queue (e.g. AWS SQS) for reliability |
-| Email retry | No retry on failure | Queue-backed retry with exponential backoff |
-| Observability | stdout logs | Structured logging → Datadog/Sentry; uptime monitoring |
-| CI/CD | None | GitHub Actions: lint, test, build, deploy on merge to main |
-| Secrets | .env file | Secrets manager (AWS Secrets Manager, GCP Secret Manager, HashiCorp Vault) |
-| Database | Single instance | Managed PostgreSQL (RDS/Cloud SQL) with read replicas and automated backups |
-| HTTPS | None (HTTP) | TLS termination at load balancer; HSTS headers |
-| CORS | Permissive | Restrict `allowed_origins` to the production frontend domain only |
+| Postgres container | **RDS (Multi-AZ)** | `DATABASE_URL` only. |
+| Local upload volume | **S3 + pre-signed URLs** | Swap the `storage` service implementation; the interface (`save_resume`/`delete_resume`) already isolates this. |
+| MailHog / Resend | **SES or Resend** | `EMAIL_BACKEND` env; the email service is already pluggable. |
+| In-memory rate limiter | **WAF rate rules / ElastiCache** | Replace one module (`ratelimit`) — see §11. |
+| Compose | **ECS Fargate + ALB**, web on **S3/CloudFront** | Containers already built; add task defs + autoscaling. |
+| Hardcoded demo secrets | **Secrets Manager** | Inject env at task start. |
+
+The seams that make this cheap — a pluggable storage interface, a pluggable email backend, a
+single isolated rate-limit module, and stateless JWT auth (no session store to externalize) —
+were chosen deliberately for exactly this reason.
+
+---
+
+## 4. Service architecture & interactions
+
+The backend is layered: HTTP endpoints are thin; business rules live in **services** (pure where
+possible, for testability); data access lives in **crud**; the database is the source of truth.
+
+```mermaid
+flowchart TB
+  subgraph API["FastAPI endpoints (thin)"]
+    PUB["/leads (public submit)"]
+    ATT["/leads/* (attorney)"]
+    ADM["/admin/* (admin)"]
+    AUTH["/auth/*"]
+  end
+  subgraph SVC["Services (business logic)"]
+    ASSIGN["assignment<br/>least-loaded + capacity"]
+    IDENT["identity<br/>normalize + dedup"]
+    TL["timeline<br/>state periods + time accounting"]
+    WF["workflow<br/>state machine + version guard"]
+    AUD["audit<br/>append-only + SSE pub/sub"]
+    STORE["storage<br/>validate + persist resume"]
+    MAIL["email<br/>pluggable, fire-and-forget"]
+    RL["ratelimit<br/>per-IP token check"]
+  end
+  CRUD["crud (leads / users / settings)"]
+  DB[("PostgreSQL")]
+
+  PUB --> IDENT & STORE & RL & ASSIGN & MAIL
+  ATT --> ASSIGN & TL & WF & AUD
+  ADM --> TL & AUD
+  AUTH --> CRUD
+  SVC --> CRUD --> DB
+  AUD -.->|"SSE stream"| ADM
+```
+
+Pure, DB-free helpers (`choose_least_loaded`, `aggregate_attorney_time`,
+`compute_duration_seconds`, `can_transition`, `version_conflict`) are split out so the policy is
+unit-tested in isolation, separate from integration tests that hit a real database.
+
+---
+
+## 5. Database architecture
+
+```mermaid
+erDiagram
+  USERS ||--o{ LEADS : "assignee"
+  USERS ||--o{ LEAD_STATE_PERIODS : "held by"
+  LEADS ||--o{ LEAD_STATE_PERIODS : "has timeline"
+  LEADS ||--o{ AUDIT_EVENTS : "audited by"
+  LEADS ||--o{ LEADS : "duplicate_of (link, never merge)"
+
+  USERS {
+    uuid id PK
+    string email UK
+    string hashed_password
+    string first_name
+    string last_name
+    string full_name
+    string role "ADMIN | ATTORNEY"
+    int max_open_cases
+    bool is_active
+  }
+  LEADS {
+    uuid id PK
+    string lead_number UK "LEAD-000123"
+    string first_name
+    string last_name
+    string email
+    string normalized_email "indexed (dedup)"
+    string phone
+    string normalized_phone "indexed (history)"
+    text message
+    string resume_filename "UUID-named on disk"
+    string status "PENDING | REACHED_OUT"
+    uuid assignee_id FK
+    int version "optimistic lock"
+    string idempotency_key UK
+    uuid duplicate_of FK
+    bool is_potential_duplicate
+    timestamptz created_at
+  }
+  AUDIT_EVENTS {
+    uuid id PK
+    uuid lead_id FK
+    uuid actor_id FK
+    string actor_kind "PUBLIC|ATTORNEY|ADMIN|SYSTEM"
+    string action
+    jsonb before
+    jsonb after
+    string reason
+    string ip
+    timestamptz created_at
+  }
+  LEAD_STATE_PERIODS {
+    uuid id PK
+    uuid lead_id FK
+    string state "QUEUED|ASSIGNED|REACHED_OUT"
+    uuid assignee_id FK
+    timestamptz entered_at
+    timestamptz exited_at "NULL = open period"
+    int duration_seconds
+  }
+  APP_SETTINGS {
+    int id PK "singleton row = 1"
+    bool auto_assign_enabled
+  }
+```
+
+**Why the schema looks like this:**
+
+- **`version` (optimistic lock).** Every mutating write checks the client's expected version and
+  increments. Two attorneys assigning the same lead → the second gets `409`, never a silent
+  overwrite. Chosen over row locks because contention is short and reads vastly outnumber writes.
+- **`audit_events` is append-only.** No update/delete path exists in code. It's the compliance
+  spine: every assign / reach-out / reverse / capacity change / toggle is a row, with
+  `before`/`after` JSONB. It also feeds the live SSE stream.
+- **`lead_state_periods` (interval model).** Rather than store only the current status, each
+  state the lead passes through is a row with `entered_at`/`exited_at`. Exactly one period is
+  open per lead at any time. This is what makes "how long did each attorney hold each case" a
+  query, not a guess — it directly answers the *justify attorney time* requirement.
+- **Dedup by linkage, never merge.** A suspected duplicate gets `duplicate_of` pointing at the
+  earliest match and `is_potential_duplicate = true`. Families sharing an email, or one person
+  re-applying, are **never collapsed** — each submission stays a distinct, auditable case. An
+  attorney can transition a whole open cluster together (see §7).
+- **Normalized columns** (`normalized_email`, `normalized_phone`) are indexed and power dedup and
+  case-history matching without touching the human-entered originals.
+
+---
+
+## 6. State machine
+
+A lead's **status** is deliberately a simple two-state machine; the richer lifecycle lives in the
+**state-period timeline** (who held it, and for how long).
+
+```mermaid
+stateDiagram-v2
+  [*] --> PENDING: submit (QUEUED period opens)
+  PENDING --> REACHED_OUT: mark reached out (assignee/admin, requires assignment)
+  REACHED_OUT --> PENDING: reverse (audited, reason required)
+  REACHED_OUT --> [*]
+  note right of PENDING
+    Timeline period: QUEUED (unassigned)
+    then ASSIGNED (self / auto / reassign)
+  end note
+```
+
+- A lead is born `PENDING` with an open **QUEUED** period.
+- Self-assign / auto-assign / reassign closes the current period and opens an **ASSIGNED** one.
+- Marking reached out requires an assignee (so the reach-out is always attributable) and opens a
+  **REACHED_OUT** period; the status transition is guarded by `can_transition` and the version.
+- Reversal restores the *exact* prior state (the last closed period — usually ASSIGNED, with its
+  assignee), requires a reason, and is fully audited.
+
+---
+
+## 7. Core flows
+
+### Public intake (the hardened path)
+
+```mermaid
+sequenceDiagram
+  participant P as Prospect
+  participant API as FastAPI
+  participant DB as Postgres
+  participant M as Email (async)
+  P->>API: POST /leads (multipart + resume)
+  API->>API: honeypot? then 202 decoy (audited)
+  API->>API: per-IP rate limit? then 429
+  API->>API: idempotency key seen? then replay receipt
+  API->>API: validate fields + sniff file magic bytes
+  API->>DB: dedup check (normalized_email)
+  API->>DB: INSERT lead (retry on number/idempotency race)
+  API->>DB: open QUEUED period + LEAD_CREATED audit
+  alt auto-assign enabled
+    API->>DB: pick least-loaded under-cap attorney then ASSIGNED
+  end
+  API--)M: fire-and-forget prospect + attorney emails
+  API-->>P: 201 minimal receipt (lead_number, status only)
+```
+
+The response is a **minimal receipt** — no internal fields (assignee, version, IP, dedup
+linkage) ever cross the public boundary.
+
+### Assignment under concurrency
+
+```mermaid
+sequenceDiagram
+  participant A1 as Attorney A
+  participant A2 as Attorney B
+  participant API as FastAPI
+  participant DB as Postgres
+  A1->>API: POST /leads/{id}/assign (version=3)
+  A2->>API: POST /leads/{id}/assign (version=3)
+  API->>DB: A: version matches + has capacity then assign, version=4
+  API-->>A1: 200 (now yours)
+  API->>DB: B: version 3 != 4 then conflict
+  API-->>A2: 409 (reload and retry)
+```
+
+### Related-duplicate bulk transition
+
+From a lead's detail view, if other **open** leads share its duplicate cluster, the attorney can
+select them and **assign-to-self** or **mark-reached-out** in one action. Each transition writes
+an audit note referencing the **parent case number**, so the trail shows they were handled
+together — without ever merging the records.
+
+---
+
+## 8. Lead assignment logic
+
+Two modes share one policy:
+
+- **Self-assign** (pull): an attorney claims from the FIFO queue. Guarded by capacity
+  (`open_case_count < max_open_cases`) and the version check.
+- **Auto-assign** (push): on submit, if enabled, the system picks the **least-loaded active
+  attorney under capacity**; ties break deterministically by user id (round-robin friendly).
+  Returns nobody if everyone is full — the lead simply stays queued.
+
+```mermaid
+flowchart TB
+  S["new lead / claim attempt"] --> C{"auto-assign on?"}
+  C -- "no (self-assign)" --> Cap1{"caller under cap<br/>and version ok?"}
+  Cap1 -- yes --> A1["assign + open ASSIGNED + audit"]
+  Cap1 -- no --> X1["409"]
+  C -- yes --> P["list active attorneys<br/>+ open counts"]
+  P --> E{"any under cap?"}
+  E -- yes --> LL["choose min load<br/>(id tiebreak)"] --> A2["assign + audit"]
+  E -- no --> Q["leave QUEUED"]
+```
+
+The capacity/least-loaded decision (`choose_least_loaded`) is a **pure function** over
+`(attorney_id, open_count, cap)` tuples, unit-tested independently of the database.
+
+---
+
+## 9. Notifications design
+
+On every submission, **both** the prospect (confirmation) and the attorney (new-lead alert) are
+emailed. The design goal: notifications must **never** affect intake success or latency, and must
+be **viewable** in local dev without any external account.
+
+```mermaid
+flowchart LR
+  Submit["POST /leads succeeds"] --> Fire["create_task(send_lead_emails)"]
+  Fire -.->|"tracked set,<br/>not awaited"| Disp["_send_email dispatch"]
+  Disp --> B{"EMAIL_BACKEND"}
+  B -- console --> Log["log only"]
+  B -- smtp --> MH["MailHog :1025<br/>(view at :8025)"]
+  B -- resend --> R["Resend API<br/>retry + backoff"]
+  Submit --> Receipt["201 receipt (immediate)"]
+```
+
+- **Fire-and-forget, fault-tolerant.** Emails are dispatched as a tracked `asyncio` task after
+  the response is prepared. The dispatcher **never raises** — a mail failure logs and is dropped,
+  it can't 500 the intake. Task references are held so they aren't garbage-collected mid-flight.
+- **MailHog for local/demo.** A real SMTP server with a web inbox — you *see* the actual emails
+  at http://localhost:8025 with zero signup. Quick, basic, and honest (no mocking).
+- **Resend for production**, with bounded retries, exponential backoff, and per-attempt timeouts
+  for transient `429/5xx`. Swapping is one env var (`EMAIL_BACKEND`).
+
+---
+
+## 10. API surface + Swagger
+
+Interactive **Swagger/OpenAPI** is auto-generated and live at **`/docs`** (ReDoc at `/redoc`).
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| POST | `/api/v1/leads` | public | Submit a lead (multipart) → minimal receipt |
+| GET | `/api/v1/leads` | staff | Paginated list |
+| GET | `/api/v1/leads/queue` | staff | Unassigned PENDING (FIFO) |
+| GET | `/api/v1/leads/my-cases` | staff | Caller's open assigned leads |
+| GET | `/api/v1/leads/by-number/{n}` | staff | Lookup by `LEAD-…` number |
+| GET | `/api/v1/leads/{id}` | staff | Detail + timeline |
+| GET | `/api/v1/leads/{id}/resume` | staff | Download resume (token-gated, PII) |
+| GET | `/api/v1/leads/{id}/history` | staff | Prior cases (phone/email/name, 6mo) |
+| GET | `/api/v1/leads/{id}/related` | staff | Open leads in the duplicate cluster |
+| POST | `/api/v1/leads/{id}/related/transition` | staff | Bulk assign / reach-out related leads |
+| POST | `/api/v1/leads/{id}/assign` | staff | Self-assign |
+| POST | `/api/v1/leads/{id}/reassign` | staff | Reassign / unassign |
+| PATCH | `/api/v1/leads/{id}/status` | staff | Mark REACHED_OUT |
+| POST | `/api/v1/leads/{id}/reverse` | staff | Reverse (reason required) |
+| POST | `/api/v1/auth/login` | public | Get JWT |
+| GET | `/api/v1/auth/me` | staff | Current user |
+| GET | `/api/v1/admin/attorneys` | admin | Capacity + current load |
+| PUT | `/api/v1/admin/attorneys/{id}/capacity` | admin | Set max open cases |
+| PUT | `/api/v1/admin/settings/auto-assign` | admin | Toggle auto-assign |
+| GET | `/api/v1/admin/audit` | admin | Recent audit events |
+| GET | `/api/v1/admin/audit/stream` | admin | **Live audit (SSE)** |
+| GET | `/api/v1/admin/metrics` | admin | Operational dashboard metrics |
+| GET | `/api/v1/admin/attorney-time` | admin | Per-attorney time accounting |
+| GET | `/health` | public | Health check |
+
+---
+
+## 11. Security & hardening
+
+- **Public boundary**: honeypot field, per-IP rate limiting, idempotency keys, streaming
+  upload-size cap (no full-file buffering → no memory-exhaustion DoS), and **content-based file
+  validation** (PDF/DOC/DOCX verified by magic bytes, not the client-supplied MIME/extension).
+- **No data leakage**: the public submit returns only a pinned minimal receipt; resumes are PII
+  and served only to authenticated staff via a token, never as static files.
+- **AuthZ**: role-gated endpoints; only the assignee or an admin can mutate a lead.
+- **Proxy spoofing**: `X-Forwarded-For` is honored *only* when `TRUST_PROXY_HEADERS` is set, so a
+  client can't mint fresh rate-limit buckets by spoofing the header.
+- **Retention**: a cleanup job purges leads older than one year, removing PII while keeping a
+  PII-free `CASE_PURGED` audit row.
+
+> **Known prototype tradeoff:** the rate limiter is in-memory (per-process). It's deliberately
+> isolated in one module so production swaps it for WAF rules or a shared store — see §3.
+
+---
+
+## 12. UX design
+
+- **One job per screen.** Prospect: a single form. Attorney: queue → my intakes → one detail
+  view. Admin: one operational dashboard.
+- **Decisions without navigation.** The lead detail page co-locates the timeline, 6-month case
+  history (toggle match dimensions), and related open duplicates — the attorney sees everything
+  needed to act in one place.
+- **Live, not stale.** The admin audit streams over SSE; the queue and metrics reflect ground
+  truth, so "what's happening right now" is never a guess.
+- **Identity is explicit.** The navbar shows the signed-in attorney's name and labels their
+  workspace "<Name>'s Intakes" — small touches that make a shared tool feel personal.
+- **Coherent visual language.** A small Tailwind token set (Alma-inspired navy/teal) and a shared
+  component library keep every surface consistent.
+
+---
+
+## 13. Why / how — decisions at a glance
+
+| Decision | Alternative considered | Why this won |
+|---|---|---|
+| Optimistic locking (`version`) | Pessimistic row locks | Reads ≫ writes; short contention; no held locks, clean 409 semantics. |
+| Append-only audit + interval periods | A single `status` column + `updated_at` | Only this can *prove* who did what and *justify time*; compliance-grade. |
+| Link-and-flag dedup | Merge duplicates | Merging destroys records and mishandles families; linking keeps every case auditable. |
+| Pluggable email + MailHog | Mock email in tests / Resend-only | Real, viewable mail locally; one-env swap to prod; intake never blocked. |
+| FastAPI + one Postgres | Microservices / broker / cache | Simplicity-first; the workload doesn't justify the operational cost. |
+| Stateless JWT | Server sessions | Nothing to externalize when scaling to multiple tasks. |
+| Pure policy functions | Logic inside endpoints | Fast, deterministic unit tests for the rules that matter most. |
+
+---
+
+## 14. Verification
+
+The system is proven, not asserted: a unit + integration suite (state-based invariants, not
+timing-dependent) plus a **repeatable load/benchmark recipe** (`backend/tests/load/`) that drives
+1000 leads / 75 attorneys through every flow and asserts correctness invariants, with a
+clean-state teardown that never deletes real data and an error-rate gate. The latest curated run
+is in [`docs/benchmarks/`](docs/benchmarks/): **0% error rate, 0×5xx, all invariants held.**
