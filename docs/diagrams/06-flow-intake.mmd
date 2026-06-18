@@ -1,0 +1,18 @@
+sequenceDiagram
+  participant P as Prospect
+  participant API as FastAPI
+  participant DB as Postgres
+  participant M as Email (async)
+  P->>API: POST /leads (multipart + resume)
+  API->>API: honeypot? then 202 decoy (audited)
+  API->>API: per-IP rate limit? then 429
+  API->>API: idempotency key seen? then replay receipt
+  API->>API: validate fields + sniff file magic bytes
+  API->>DB: dedup check (normalized_email)
+  API->>DB: INSERT lead (retry on number/idempotency race)
+  API->>DB: open QUEUED period + LEAD_CREATED audit
+  alt auto-assign enabled
+    API->>DB: pick least-loaded under-cap attorney then ASSIGNED
+  end
+  API--)M: fire-and-forget prospect + attorney emails
+  API-->>P: 201 minimal receipt (lead_number, status only)

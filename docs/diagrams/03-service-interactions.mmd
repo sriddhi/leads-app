@@ -1,0 +1,26 @@
+flowchart TB
+  subgraph API["FastAPI endpoints (thin)"]
+    PUB["/leads (public submit)"]
+    ATT["/leads/* (attorney)"]
+    ADM["/admin/* (admin)"]
+    AUTH["/auth/*"]
+  end
+  subgraph SVC["Services (business logic)"]
+    ASSIGN["assignment<br/>least-loaded + capacity"]
+    IDENT["identity<br/>normalize + dedup"]
+    TL["timeline<br/>state periods + time accounting"]
+    WF["workflow<br/>state machine + version guard"]
+    AUD["audit<br/>append-only + SSE pub/sub"]
+    STORE["storage<br/>validate + persist resume"]
+    MAIL["email<br/>pluggable, fire-and-forget"]
+    RL["ratelimit<br/>per-IP token check"]
+  end
+  CRUD["crud (leads / users / settings)"]
+  DB[("PostgreSQL")]
+
+  PUB --> IDENT & STORE & RL & ASSIGN & MAIL
+  ATT --> ASSIGN & TL & WF & AUD
+  ADM --> TL & AUD
+  AUTH --> CRUD
+  SVC --> CRUD --> DB
+  AUD -.->|"SSE stream"| ADM

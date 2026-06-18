@@ -29,3 +29,6 @@ frontend/.env
 
 # Transient load-run outputs (the curated baseline lives in docs/benchmarks/)
 backend/tests/load/reports/
+
+# Rendered diagram images — regenerable from the .mmd sources (see docs/diagrams/README.md)
+docs/diagrams/*.png

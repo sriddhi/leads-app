@@ -1,0 +1,10 @@
+flowchart TB
+  U["Users"] --> CF["CloudFront + WAF"]
+  CF --> S3["S3 (Next.js static assets)"]
+  CF --> ALB["Application Load Balancer"]
+  ALB --> ECS["FastAPI on ECS Fargate<br/>(auto-scaling tasks)"]
+  ECS --> RDS[("RDS PostgreSQL<br/>Multi-AZ")]
+  ECS --> S3R["S3 (resume objects,<br/>pre-signed URLs)"]
+  ECS --> SES["SES / Resend<br/>(transactional email)"]
+  ECS --> SM["Secrets Manager<br/>(JWT key, DB creds)"]
+  ECS --> CW["CloudWatch (logs + metrics)"]

@@ -80,8 +80,10 @@ real `.env` or any secret** — `.env` files, logs, and local tooling settings a
 
 ## More docs
 
-- [`DESIGN.md`](DESIGN.md) — architecture and key decisions.
-- [`AGENTS.md`](AGENTS.md) — how this was built.
+- [`DESIGN.md`](DESIGN.md) — system design, diagrams, and the why behind each decision.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — implementation deep-dive (request lifecycle, concurrency, audit, time accounting).
+- [`RUNBOOK.md`](RUNBOOK.md) — run, operate, and troubleshoot.
+- [`AGENTS.md`](AGENTS.md) — how this was built (coding-agent usage).
 
 ---
 

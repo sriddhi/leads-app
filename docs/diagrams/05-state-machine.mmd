@@ -1,0 +1,9 @@
+stateDiagram-v2
+  [*] --> PENDING: submit (QUEUED period opens)
+  PENDING --> REACHED_OUT: mark reached out (assignee/admin, requires assignment)
+  REACHED_OUT --> PENDING: reverse (audited, reason required)
+  REACHED_OUT --> [*]
+  note right of PENDING
+    Timeline period: QUEUED (unassigned)
+    then ASSIGNED (self / auto / reassign)
+  end note

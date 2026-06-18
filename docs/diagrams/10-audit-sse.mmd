@@ -1,0 +1,7 @@
+flowchart LR
+  W["audit.record()"] --> I["INSERT (durable)"]
+  W --> P["publish()"]
+  P --> Q1["queue: admin A"]
+  P --> Q2["queue: admin B"]
+  Q1 --> S1["SSE /admin/audit/stream"]
+  P -. "queue full → drop, never block" .-> X[(slow consumer)]

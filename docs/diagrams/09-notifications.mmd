@@ -1,0 +1,8 @@
+flowchart LR
+  Submit["POST /leads succeeds"] --> Fire["create_task(send_lead_emails)"]
+  Fire -.->|"tracked set,<br/>not awaited"| Disp["_send_email dispatch"]
+  Disp --> B{"EMAIL_BACKEND"}
+  B -- console --> Log["log only"]
+  B -- smtp --> MH["MailHog :1025<br/>(view at :8025)"]
+  B -- resend --> R["Resend API<br/>retry + backoff"]
+  Submit --> Receipt["201 receipt (immediate)"]

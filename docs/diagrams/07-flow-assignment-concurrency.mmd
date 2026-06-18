@@ -1,0 +1,11 @@
+sequenceDiagram
+  participant A1 as Attorney A
+  participant A2 as Attorney B
+  participant API as FastAPI
+  participant DB as Postgres
+  A1->>API: POST /leads/{id}/assign (version=3)
+  A2->>API: POST /leads/{id}/assign (version=3)
+  API->>DB: A: version matches + has capacity then assign, version=4
+  API-->>A1: 200 (now yours)
+  API->>DB: B: version 3 != 4 then conflict
+  API-->>A2: 409 (reload and retry)

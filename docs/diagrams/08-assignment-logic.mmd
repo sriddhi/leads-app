@@ -1,0 +1,9 @@
+flowchart TB
+  S["new lead / claim attempt"] --> C{"auto-assign on?"}
+  C -- "no (self-assign)" --> Cap1{"caller under cap<br/>and version ok?"}
+  Cap1 -- yes --> A1["assign + open ASSIGNED + audit"]
+  Cap1 -- no --> X1["409"]
+  C -- yes --> P["list active attorneys<br/>+ open counts"]
+  P --> E{"any under cap?"}
+  E -- yes --> LL["choose min load<br/>(id tiebreak)"] --> A2["assign + audit"]
+  E -- no --> Q["leave QUEUED"]

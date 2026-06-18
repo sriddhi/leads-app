@@ -1,0 +1,13 @@
+flowchart LR
+  Browser["Browser"] -->|":3000"| FE["Next.js (web)"]
+  FE -->|"/api/v1 :8000"| API["FastAPI (backend)"]
+  API -->|"asyncpg"| DB[("PostgreSQL 16")]
+  API -->|"SMTP :1025"| MH["MailHog<br/>(catch-all inbox, UI :8025)"]
+  API -->|"write"| FS["resume uploads<br/>(local volume)"]
+  subgraph compose["docker compose (one network)"]
+    FE
+    API
+    DB
+    MH
+    FS
+  end

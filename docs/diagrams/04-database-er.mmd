@@ -1,0 +1,62 @@
+erDiagram
+  USERS ||--o{ LEADS : "assignee"
+  USERS ||--o{ LEAD_STATE_PERIODS : "held by"
+  LEADS ||--o{ LEAD_STATE_PERIODS : "has timeline"
+  LEADS ||--o{ AUDIT_EVENTS : "audited by"
+  LEADS ||--o{ LEADS : "duplicate_of (link, never merge)"
+
+  USERS {
+    uuid id PK
+    string email UK
+    string hashed_password
+    string first_name
+    string last_name
+    string full_name
+    string role "ADMIN | ATTORNEY"
+    int max_open_cases
+    bool is_active
+  }
+  LEADS {
+    uuid id PK
+    string lead_number UK "LEAD-000123"
+    string first_name
+    string last_name
+    string email
+    string normalized_email "indexed (dedup)"
+    string phone
+    string normalized_phone "indexed (history)"
+    text message
+    string resume_filename "UUID-named on disk"
+    string status "PENDING | REACHED_OUT"
+    uuid assignee_id FK
+    int version "optimistic lock"
+    string idempotency_key UK
+    uuid duplicate_of FK
+    bool is_potential_duplicate
+    timestamptz created_at
+  }
+  AUDIT_EVENTS {
+    uuid id PK
+    uuid lead_id FK
+    uuid actor_id FK
+    string actor_kind "PUBLIC|ATTORNEY|ADMIN|SYSTEM"
+    string action
+    jsonb before
+    jsonb after
+    string reason
+    string ip
+    timestamptz created_at
+  }
+  LEAD_STATE_PERIODS {
+    uuid id PK
+    uuid lead_id FK
+    string state "QUEUED|ASSIGNED|REACHED_OUT"
+    uuid assignee_id FK
+    timestamptz entered_at
+    timestamptz exited_at "NULL = open period"
+    int duration_seconds
+  }
+  APP_SETTINGS {
+    int id PK "singleton row = 1"
+    bool auto_assign_enabled
+  }
