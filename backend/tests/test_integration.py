@@ -6,6 +6,7 @@ these tests read full lead data back through the AUTHENTICATED internal API (by 
 Requires a reachable DATABASE_URL with migrations applied and seed users present.
 """
 
+import asyncio
 import io
 import uuid
 
@@ -205,6 +206,81 @@ async def test_optimistic_lock_and_single_assignee():
         assert (await c.post(f"{BASE}/leads/{lid}/assign", json={"version": ver}, headers=att)).status_code == 200
         # stale version → conflict
         assert (await c.post(f"{BASE}/leads/{lid}/assign", json={"version": ver}, headers=att)).status_code == 409
+
+
+async def test_concurrent_self_assign_has_exactly_one_winner():
+    """The headline guarantee: two attorneys racing to claim the SAME queued lead with the
+    SAME (valid) version must not both succeed. The DB-level version_id_col compare-and-swap
+    is what enforces this — the in-memory version pre-check alone would let both through, since
+    both load version=1 before either commits. Exactly one 200, one 409; no double-assign."""
+    async with _client() as c:
+        admin = await _auth(c, "admin@company.com", "admin123")
+        att1 = await _auth(c, "attorney@company.com", "attorney123")
+        att2 = await _auth(c, "attorney2@company.com", "attorney123")
+        await c.put(f"{BASE}/admin/settings/auto-assign", json={"enabled": False}, headers=admin)
+        await _free_capacity(c, admin, "attorney@company.com")
+        await _free_capacity(c, admin, "attorney2@company.com")
+
+        ln = (await _submit(c, first="Race", email=_uniq("race"))).json()["lead_number"]
+        lead = await _by_number(c, att1, ln)
+        lid, ver = lead["id"], lead["version"]
+
+        # Fire both claims concurrently with the same starting version.
+        r1, r2 = await asyncio.gather(
+            c.post(f"{BASE}/leads/{lid}/assign", json={"version": ver}, headers=att1),
+            c.post(f"{BASE}/leads/{lid}/assign", json={"version": ver}, headers=att2),
+        )
+        codes = sorted([r1.status_code, r2.status_code])
+        assert codes == [200, 409], (r1.status_code, r1.text, r2.status_code, r2.text)
+
+        # The lead is assigned to exactly one attorney, and the version advanced exactly once.
+        after = await _by_number(c, admin, ln)
+        assert after["assignee_id"] is not None
+        assert after["version"] == ver + 1
+
+
+async def test_concurrent_reached_out_has_exactly_one_winner():
+    """Same CAS guarantee on the status transition: two concurrent REACHED_OUT patches at the
+    same version cannot both win (which would double-count time accounting / emit two events)."""
+    async with _client() as c:
+        admin = await _auth(c, "admin@company.com", "admin123")
+        att = await _auth(c, "attorney@company.com", "attorney123")
+        await c.put(f"{BASE}/admin/settings/auto-assign", json={"enabled": False}, headers=admin)
+        await _free_capacity(c, admin)
+
+        ln = (await _submit(c, first="Reach", email=_uniq("reach"))).json()["lead_number"]
+        lead = await _by_number(c, att, ln)
+        lid = lead["id"]
+        await c.post(f"{BASE}/leads/{lid}/assign", json={"version": lead["version"]}, headers=att)
+        ver = (await _by_number(c, att, ln))["version"]
+
+        body = {"status": "REACHED_OUT", "version": ver}
+        r1, r2 = await asyncio.gather(
+            c.patch(f"{BASE}/leads/{lid}/status", json=body, headers=att),
+            c.patch(f"{BASE}/leads/{lid}/status", json=body, headers=att),
+        )
+        assert sorted([r1.status_code, r2.status_code]) == [200, 409], (r1.text, r2.text)
+        assert (await _by_number(c, admin, ln))["status"] == "REACHED_OUT"
+
+
+async def test_auto_assign_bumps_version_no_gap():
+    """Versioning has no gaps: the auto-assign path (which previously set assignee_id without
+    bumping version) now advances the version like every other mutation, because version_id_col
+    is managed by the DB on every UPDATE. A freshly auto-assigned lead is at version 2."""
+    async with _client() as c:
+        admin = await _auth(c, "admin@company.com", "admin123")
+        await c.put(f"{BASE}/admin/settings/auto-assign", json={"enabled": True}, headers=admin)
+        await _free_capacity(c, admin, "attorney@company.com")
+        await _free_capacity(c, admin, "attorney2@company.com")
+        await _free_capacity(c, admin, "attorney3@company.com")
+        try:
+            ln = (await _submit(c, first="Auto", email=_uniq("auto"))).json()["lead_number"]
+            lead = await _by_number(c, admin, ln)
+            assert lead["assignee_id"] is not None, "expected auto-assignment"
+            assert lead["version"] == 2, f"auto-assign should bump version to 2, got {lead['version']}"
+        finally:
+            # Restore default so other tests aren't affected by shared DB state.
+            await c.put(f"{BASE}/admin/settings/auto-assign", json={"enabled": False}, headers=admin)
 
 
 async def test_reached_out_requires_assignment_and_reversal_restores_state():

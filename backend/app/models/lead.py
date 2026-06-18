@@ -76,5 +76,14 @@ class Lead(Base):
         onupdate=lambda: datetime.now(timezone.utc),
     )
 
+    # Atomic optimistic locking, enforced at the database — NOT just in application
+    # memory. SQLAlchemy appends `AND version = :loaded_version` to every UPDATE/DELETE
+    # for this row, increments the column itself, and raises StaleDataError when the
+    # predicate matches 0 rows (i.e. another transaction changed the row first). This is
+    # the compare-and-swap that makes "no double-assign, no lost updates" actually true
+    # under concurrency. Because SQLAlchemy owns this column, application code must NEVER
+    # increment `version` by hand — doing so corrupts the managed value.
+    __mapper_args__ = {"version_id_col": version}
+
     def __repr__(self) -> str:
         return f"<Lead id={self.id} email={self.email} status={self.status}>"

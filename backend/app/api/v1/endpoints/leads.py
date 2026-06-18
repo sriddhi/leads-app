@@ -45,6 +45,7 @@ from pathlib import Path
 
 from fastapi.responses import FileResponse
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm.exc import StaleDataError
 
 from app.core.config import settings
 from app.core.security import decode_access_token
@@ -564,55 +565,62 @@ async def transition_related(
             ))
             continue
 
+        # Each lead is mutated inside its own SAVEPOINT. The version_id_col compare-and-swap
+        # can raise StaleDataError if a lead was changed concurrently; the savepoint lets us
+        # roll back just that one lead and report it as a per-lead failure, exactly like the
+        # in-memory _SkipReason checks, without poisoning the rest of the batch.
         try:
-            if body.action == "assign":
-                if lead.assignee_id is not None:
-                    raise _SkipReason(
-                        "Already assigned."
-                        if lead.assignee_id != current_user.id
-                        else "Already assigned to you."
+            async with db.begin_nested():
+                if body.action == "assign":
+                    if lead.assignee_id is not None:
+                        raise _SkipReason(
+                            "Already assigned."
+                            if lead.assignee_id != current_user.id
+                            else "Already assigned to you."
+                        )
+                    if not await assignment.has_capacity(db, current_user):
+                        raise _SkipReason("You are at your maximum open case capacity.")
+                    lead.assignee_id = current_user.id
+                    lead.updated_at = datetime.now(timezone.utc)
+                    db.add(lead)
+                    await db.flush()
+                    await timeline.open_period(db, lead, state="ASSIGNED", assignee_id=current_user.id)
+                    await audit.record(
+                        db, lead_id=lead.id, actor_id=current_user.id, actor_kind=current_user.role,
+                        action="SELF_ASSIGNED",
+                        after={"assignee_id": str(current_user.id), "parent_lead": parent.lead_number},
+                        reason=reason,
                     )
-                if not await assignment.has_capacity(db, current_user):
-                    raise _SkipReason("You are at your maximum open case capacity.")
-                lead.assignee_id = current_user.id
-                lead.version += 1
-                lead.updated_at = datetime.now(timezone.utc)
-                db.add(lead)
-                await db.flush()
-                await timeline.open_period(db, lead, state="ASSIGNED", assignee_id=current_user.id)
-                await audit.record(
-                    db, lead_id=lead.id, actor_id=current_user.id, actor_kind=current_user.role,
-                    action="SELF_ASSIGNED",
-                    after={"assignee_id": str(current_user.id), "parent_lead": parent.lead_number},
-                    reason=reason,
-                )
-                results.append(RelatedTransitionResult(
-                    id=lead.id, lead_number=lead.lead_number, ok=True, detail="Assigned to you.",
-                ))
-            else:  # reached_out
-                if lead.assignee_id is None:
-                    raise _SkipReason("Lead must be assigned before it can be reached out.")
-                if not is_admin and lead.assignee_id != current_user.id:
-                    raise _SkipReason("Assigned to another attorney.")
-                before = {"status": lead.status}
-                lead.status = "REACHED_OUT"
-                lead.version += 1
-                lead.updated_at = datetime.now(timezone.utc)
-                db.add(lead)
-                await db.flush()
-                await timeline.open_period(db, lead, state="REACHED_OUT", assignee_id=lead.assignee_id)
-                await audit.record(
-                    db, lead_id=lead.id, actor_id=current_user.id, actor_kind=current_user.role,
-                    action="MARKED_REACHED_OUT",
-                    before=before, after={"status": "REACHED_OUT", "parent_lead": parent.lead_number},
-                    reason=reason,
-                )
-                results.append(RelatedTransitionResult(
-                    id=lead.id, lead_number=lead.lead_number, ok=True, detail="Marked reached out.",
-                ))
+                    detail = "Assigned to you."
+                else:  # reached_out
+                    if lead.assignee_id is None:
+                        raise _SkipReason("Lead must be assigned before it can be reached out.")
+                    if not is_admin and lead.assignee_id != current_user.id:
+                        raise _SkipReason("Assigned to another attorney.")
+                    before = {"status": lead.status}
+                    lead.status = "REACHED_OUT"
+                    lead.updated_at = datetime.now(timezone.utc)
+                    db.add(lead)
+                    await db.flush()
+                    await timeline.open_period(db, lead, state="REACHED_OUT", assignee_id=lead.assignee_id)
+                    await audit.record(
+                        db, lead_id=lead.id, actor_id=current_user.id, actor_kind=current_user.role,
+                        action="MARKED_REACHED_OUT",
+                        before=before, after={"status": "REACHED_OUT", "parent_lead": parent.lead_number},
+                        reason=reason,
+                    )
+                    detail = "Marked reached out."
+            results.append(RelatedTransitionResult(
+                id=lead.id, lead_number=lead.lead_number, ok=True, detail=detail,
+            ))
         except _SkipReason as skip:
             results.append(RelatedTransitionResult(
                 id=lead.id, lead_number=lead.lead_number, ok=False, detail=str(skip),
+            ))
+        except StaleDataError:
+            results.append(RelatedTransitionResult(
+                id=lead.id, lead_number=lead.lead_number, ok=False,
+                detail="Changed by someone else; reload and retry.",
             ))
     return results
 
@@ -635,6 +643,14 @@ async def _load_or_404(db: AsyncSession, lead_id: uuid.UUID) -> Lead:
 
 
 def _check_version(lead: Lead, expected: int) -> None:
+    """Fast, friendly pre-check: reject a stale client version before doing any work.
+
+    This is an optimization for the common case and a clearer error message — it is NOT
+    the safety guarantee. The actual guarantee is the database compare-and-swap enforced
+    by ``version_id_col`` on the model, surfaced via :func:`_flush_or_conflict`. The window
+    between this in-memory check and the flush is exactly where a concurrent writer slips
+    through, and that is what the DB-level guard closes.
+    """
     if version_conflict(lead.version, expected):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -642,6 +658,23 @@ def _check_version(lead: Lead, expected: int) -> None:
                 f"Version conflict: lead is at version {lead.version}, "
                 f"you sent {expected}. Reload and retry."
             ),
+        )
+
+
+async def _flush_or_conflict(db: AsyncSession) -> None:
+    """Flush pending changes, translating the optimistic-lock failure into a 409.
+
+    With ``version_id_col`` configured, SQLAlchemy emits ``UPDATE ... WHERE id=:id AND
+    version=:loaded`` and raises :class:`StaleDataError` when that matches 0 rows — i.e.
+    another transaction committed a change to this row after we loaded it. That is the
+    atomic compare-and-swap; we map it to the same 409 a stale version would produce.
+    """
+    try:
+        await db.flush()
+    except StaleDataError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This lead was just modified by someone else. Reload and retry.",
         )
 
 
@@ -673,10 +706,9 @@ async def assign_lead(
 
     before = {"assignee_id": None}
     lead.assignee_id = current_user.id
-    lead.version += 1
     lead.updated_at = datetime.now(timezone.utc)
     db.add(lead)
-    await db.flush()
+    await _flush_or_conflict(db)  # version_id_col CAS: loses the race -> 409, never double-assigns
 
     await timeline.open_period(db, lead, state="ASSIGNED", assignee_id=current_user.id)
     await audit.record(
@@ -731,10 +763,9 @@ async def reassign_lead(
             )
 
     lead.assignee_id = target_id
-    lead.version += 1
     lead.updated_at = datetime.now(timezone.utc)
     db.add(lead)
-    await db.flush()
+    await _flush_or_conflict(db)
 
     if target_id is not None:
         await timeline.open_period(db, lead, state="ASSIGNED", assignee_id=target_id)
@@ -805,10 +836,9 @@ async def patch_lead_status(
 
     before = {"status": lead.status}
     lead.status = body.status
-    lead.version += 1
     lead.updated_at = datetime.now(timezone.utc)
     db.add(lead)
-    await db.flush()
+    await _flush_or_conflict(db)
 
     await timeline.open_period(
         db, lead, state="REACHED_OUT", assignee_id=lead.assignee_id
@@ -869,10 +899,9 @@ async def reverse_lead(
 
     lead.status = "PENDING"
     lead.assignee_id = prior_assignee
-    lead.version += 1
     lead.updated_at = datetime.now(timezone.utc)
     db.add(lead)
-    await db.flush()
+    await _flush_or_conflict(db)
 
     await timeline.open_period(db, lead, state=prior_state, assignee_id=prior_assignee)
 
