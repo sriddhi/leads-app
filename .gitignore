@@ -22,5 +22,10 @@ frontend/.env
 *.log
 .env
 
+# Local tooling / editor / agent settings — never publish
+.claude/
+.vscode/
+.idea/
+
 # Transient load-run outputs (the curated baseline lives in docs/benchmarks/)
 backend/tests/load/reports/
