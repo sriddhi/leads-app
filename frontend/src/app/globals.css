@@ -1,0 +1,22 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --canvas: #f7f6f2;
+}
+
+html,
+body {
+  background-color: var(--canvas);
+  color: #0b1f37;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Tighter, more confident headings */
+h1,
+h2,
+h3 {
+  letter-spacing: -0.015em;
+}
