@@ -27,6 +27,9 @@ frontend/.env
 .vscode/
 .idea/
 
+# Agent build-process scaffolding (spec/evaluator/scoring) — kept locally, never published
+docs/gems/
+
 # Transient load-run outputs (the curated baseline lives in docs/benchmarks/)
 backend/tests/load/reports/
 
